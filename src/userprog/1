@@ -1,0 +1,273 @@
+#include "userprog/syscall.h"
+#include <stdio.h>
+#include <syscall-nr.h>
+#include "threads/interrupt.h"
+#include "threads/thread.h"
+#include "threads/init.h"
+#include "threads/vaddr.h"
+#include "devices/shutdown.h"
+#include "filesys/filesys.h"
+#include "filesys/file.h"
+#include "userprog/process.h"
+#include <list.h>
+#include <stdlib.h>
+#include "devices/input.h"
+#include "threads/malloc.h"
+
+// defining the first file descriptor value (0,1 are not allowed)
+static int unique_fd = 2;
+
+
+
+void sys_halt (void);
+void sys_exit (int);
+bool create (const char*, unsigned);
+pid_t sys_exec(const char*);
+bool remove(const char*);
+int open(const char*);
+int filesize(int);
+int read(int, void*, unsigned);
+int write(int, const void*, unsigned);
+
+static void syscall_handler (struct intr_frame *);
+struct lock file_lock; // lock to prevents multiple threads accessing file functions 
+
+
+void
+syscall_init (void) 
+{
+  lock_init(&file_lock); //initiliasing the lock 
+  list_init(&thread_current() -> file_list);
+  intr_register_int (0x30, 3, INTR_ON, syscall_handler, "syscall");
+}
+
+
+ 
+static void 
+syscall_handler (struct intr_frame *f UNUSED)
+{
+  void* validater;
+  validater = f->esp;
+  int* int_validater;
+  int_validater = (int*) f->esp;
+  if (is_kernel_vaddr(validater)|| validater == NULL){// *int_validater < 0x08048000){
+	//validating address of stack pointer to make sure its not greater than
+	//PHYS_BASE , null or below code segment in memory 
+	  printf("Invalid call\n");
+	  sys_exit(-1);
+
+  }
+  printf("stack pointer %d", *(int*)f->esp);  
+  switch(*(int*)f->esp){
+	case SYS_HALT:{ //sys_halt
+	 sys_halt();
+	 break;
+	}
+	case SYS_EXIT:{
+	 int status  = *((int*)f->esp + 1);
+	 sys_exit(status);
+         break;
+	}
+	case SYS_EXEC:{
+	 const char *cmd_line = (char*)(*((int*) f->esp +1)); 
+         pid_t program_id = sys_exec(cmd_line);
+	 f -> eax = program_id;
+	 break;
+	}
+	case SYS_CREATE:{
+	 const char *file = (char*) (*((int*) f->esp +1));
+	 unsigned initial_size = *((unsigned*)f->esp+2);
+	 bool success_code = create(file, initial_size);
+         f -> eax = success_code;
+	 break;
+	}
+	case SYS_OPEN:{
+	 const char *file = (char*) (*((int*) f->esp+1));
+	 int file_desc = open(file);
+	 f -> eax = file_desc;
+	 break;}
+	case SYS_REMOVE:{
+	 const char *file = (char*) (*((int*) f->esp+1));
+	 bool success_code = remove(file);
+	 f -> eax = success_code;
+	 break;
+	}
+	case SYS_FILESIZE:{
+	 int fd = *((int*) f->esp +1);
+	 int size_of_file =filesize(fd);
+	 f -> eax = size_of_file;
+	 break;
+	}
+	case SYS_READ:{
+	 int fd = *((int*) f->esp +1);
+	 void* buffer = (void*) (*((int*) f->esp + 2));
+	 unsigned size = *((unsigned*)f->esp +3);
+	 int bytes_read = read(fd, buffer, size);
+	 f -> eax = bytes_read;
+	 break;
+	}
+	case SYS_WRITE:{
+	 int bytes_wrote;
+	 int fd = *((int*) f->esp +1);
+	 void* buffer= (void*) (*((int*) f->esp +2));
+	 unsigned size = *((unsigned*) f->esp +3);
+	 bytes_wrote = write(fd, buffer, size);
+	 f->eax = bytes_wrote; 
+	 break;
+	}
+
+
+		
+  }
+  printf ("system call!\n");
+  thread_exit ();
+}
+
+void sys_halt(void){
+   shutdown_power_off();
+}
+
+void sys_exit(int status){
+ thread_current() -> exit_code = status;
+ thread_exit();
+}
+bool create(const char* file, unsigned initial_size){
+
+  bool success_code = false; 
+  lock_acquire(&file_lock); //acquiring a thread lock to prevent race condition
+  if(file != NULL){ //exception handling 
+	  success_code = filesys_create(file, initial_size);
+  }
+  lock_release(&file_lock); //releasing thread lock 
+  return success_code;
+}
+pid_t sys_exec(const char* cmd_line){
+ pid_t process_id = -1;
+ lock_acquire(&file_lock); //acquiring lock as process.c uses file system
+ if(cmd_line != NULL){ //exception handling
+	process_id = process_execute(cmd_line);
+ }
+ lock_release(&file_lock);
+ return process_id;
+}
+bool remove(const char* file){
+ bool success_code = false;
+ lock_acquire(&file_lock);
+ if( file != NULL){
+	success_code = filesys_remove(file);
+ }
+ lock_release(&file_lock);
+ return success_code;
+}
+int open(const char* file){
+ int initial_fd = -1;
+ if (file != NULL){
+	lock_acquire(&file_lock);
+	struct file *fp = filesys_open(file);//creating file structure
+	struct file_desc *file_open  = malloc(sizeof(struct file_desc));
+	//allocating dynamic memory for instance of file_desc structure
+	file_open -> fd = unique_fd; 
+	//making the file descriptor = the unique_fd (starts at 2)
+	unique_fd++; //incrementing file descriptor value for next file
+	file_open -> file = fp;
+	// making the file in the structure equal to the file we have taken into the
+	// function 
+	list_push_front(&thread_current() ->file_list, &file_open->elem);
+	//pushing the element onto the file list created above
+	initial_fd = file_open ->fd;
+	lock_release(&file_lock);
+ }
+ return initial_fd;  //returning the file descriptor of the 
+ // file desc structure instance 
+}
+struct file_desc * select_file (int syscall_fd);
+
+int filesize(int syscall_fd){
+	
+	struct file_desc *selected_file_desc = select_file(syscall_fd);
+	//creating instance of file struct with the given syscall_fd
+	int size;
+	if(selected_file_desc  == NULL){ //handling null exception
+		sys_exit(-1);//if NULL then exit for length
+	}
+	lock_acquire(&file_lock);
+	size = file_length(selected_file_desc -> file);//else return size in bytes
+	lock_release(&file_lock);
+	return size;
+}
+
+
+struct file_desc * select_file(int syscall_fd){ 
+	struct list_elem *e;
+	struct file_desc *retrieved_file_desc;
+	//using given double linked list iterator to get files in list
+	for(e = list_begin (&thread_current() -> file_list); e!= list_end (&thread_current()-> file_list); e= list_next(e)){
+		struct file_desc *f = list_entry(e, struct file_desc, elem);
+		if (f -> fd == syscall_fd){
+			retrieved_file_desc =  f; // returning the file if the given
+			// fd in interrupt stack is within a file_desc struct in
+			// the file list
+		}
+		else{
+			retrieved_file_desc =  NULL;
+		
+		}
+	}	
+	//otherwise return a null file
+	return retrieved_file_desc;
+}
+
+int read(int fd, void* buffer, unsigned size){
+	int bytes_read;
+	struct file_desc* selected_file_desc = select_file(fd);
+	if(selected_file_desc == NULL || size <= 0){ //exception handling 
+		 sys_exit(-1); 
+		 //exits with code  -1 if the file doesn't exist 
+	}
+	lock_acquire(&file_lock);
+	if(fd ==0)
+	{	
+		// if fd = 0 used for stdin from keyboard
+		unsigned buffer_value;		
+		while(buffer_value < size){
+			*(uint8_t*)(buffer + buffer_value) = input_getc();
+			buffer_value++;
+		}
+		//loop through until iterator is a big as given size
+		// convert void buffer to an uint8_t as input_getc() return a
+		// byte value and then go through buffer incrementally appending
+		// each byte value
+		
+	bytes_read = size;
+
+	}
+	else{ //if any other fd use file_read function to get bytes read
+		bytes_read = file_read(selected_file_desc -> file, buffer, size);
+	}
+ lock_release(&file_lock);
+ return bytes_read;
+
+}
+int write(int fd, const void* buffer, unsigned size){
+	int written_bytes;
+	if(fd ==1){ //writing to console 
+		lock_acquire(&file_lock);
+		putbuf(buffer, size);
+		lock_release(&file_lock);
+		written_bytes = size;
+	}
+	else{ //writes size bytes from buffer to the write_file
+		struct file_desc * write_file_desc = select_file(fd);
+		if(write_file_desc == NULL || !is_user_vaddr(buffer) || !is_user_vaddr(buffer + size)) {
+			sys_exit(-1);
+		//	written_bytes = file_write(write_file_desc -> file, buffer, size);
+		}
+	
+	
+		lock_acquire(&file_lock);
+		written_bytes = file_write(write_file_desc -> file, buffer, size);
+		lock_release(&file_lock);
+	}
+	return written_bytes;		
+
+}
